@@ -32,7 +32,7 @@ const (
 	apiBase         = "your api url"
 	country         = "IND"
 	intervalMs      = 2000
-	cooldownMs      = 8000
+	cooldownMs      = 4000
 	motionThreshold = 30.0
 	maxRetries      = 3
 )
