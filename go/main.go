@@ -17,7 +17,6 @@ import (
 	"bytes"
 	"crypto/md5"
 	"crypto/tls"
-	"encoding/xml"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -28,22 +27,31 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
 // ── Config (edit these before running)
 const (
-	rtspURL          = "rtsp://{username}:{password}@{camera_ip}:{port}/Streaming/Channels/101"
-	cameraIP         = "{camera_ip}"
-	cameraUser       = "{camera_username}"
-	cameraPass       = "{camera_password}"
-	apiKey           = "your key, if any"
-	apiBase          = "your api url"
-	country          = "IND"
+	rtspURL    = "rtsp://{username}:{password}@{camera_ip}:{port}/Streaming/Channels/101"
+	cameraIP   = "{camera_ip}"
+	cameraUser = "{camera_username}"
+	cameraPass = "{camera_password}"
+	apiKey     = "your key, if any"
+	apiBase    = "your api url"
+	country    = "IND"
+
+	// cameraProtocol selects how the poller listens for vehicle events:
+	//   "isapi"   — ISAPI alert stream (any ISAPI-compatible camera)
+	//   "polling" — fallback RTSP frame polling (any camera)
+	//   "auto"    — try ISAPI first, fall back to polling automatically
+	cameraProtocol = "isapi"
+
 	cooldownMs       = 4000
-	sceneRatio       = 8       // capture 1 frame every N video frames
-	pixelThreshold   = 25.0   // % of frame pixels that must change to confirm motion
-	pixelSensitivity = 10000  // per-pixel diff sensitivity
+	pollIntervalMs   = 2000  // used in polling mode
+	sceneRatio       = 8     // capture 1 frame every N video frames
+	pixelThreshold   = 25.0  // % of frame pixels that must change to confirm motion
+	pixelSensitivity = 10000 // per-pixel diff sensitivity
 	logFile          = "/var/log/alpr.log"
 )
 
@@ -61,76 +69,6 @@ func initLogger() {
 	multi := io.MultiWriter(f, os.Stdout)
 	logger = log.New(multi, "", log.LstdFlags)
 	logger.Println("[init] logger initialized →", logFile)
-}
-
-// ─── Camera Event Listener (Prama/Hikvision ISAPI) ────────
-// Connects to the camera's built-in alert stream.
-// The camera pushes an XML event when it detects a vehicle (VMD).
-// This replaces blind polling — API is only called on a real event.
-
-type EventNotification struct {
-	EventType        string `xml:"eventType"`
-	EventState       string `xml:"eventState"`
-	EventDescription string `xml:"eventDescription"`
-}
-
-func listenCameraEvents(triggerCh chan<- bool) {
-	// Use https — camera redirects http → https with a self-signed cert.
-	// InsecureSkipVerify is safe here: this is a local LAN camera, not the internet.
-	url := fmt.Sprintf("https://%s/ISAPI/Event/notification/alertStream", cameraIP)
-
-	transport := &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-	}
-
-	for {
-		logger.Println("[event] connecting to camera alert stream...")
-
-		req, err := http.NewRequest("GET", url, nil)
-		if err != nil {
-			logger.Printf("[event] request error: %v — retrying in 5s", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-		req.SetBasicAuth(cameraUser, cameraPass)
-
-		client := &http.Client{
-			Timeout:   0, // no timeout — long-lived stream
-			Transport: transport,
-		}
-		resp, err := client.Do(req)
-		if err != nil {
-			logger.Printf("[event] connection failed: %v — retrying in 5s", err)
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		logger.Println("[event] connected to camera alert stream")
-
-		decoder := xml.NewDecoder(resp.Body)
-		for {
-			var event EventNotification
-			if err := decoder.Decode(&event); err != nil {
-				logger.Printf("[event] stream error: %v — reconnecting", err)
-				break
-			}
-
-			logger.Printf("[event] received: type=%s state=%s desc=%s",
-				event.EventType, event.EventState, event.EventDescription)
-
-			// Trigger only on VMD (Video Motion Detection) active events
-			if event.EventType == "VMD" && event.EventState == "active" {
-				logger.Println("[event] vehicle motion event from camera")
-				select {
-				case triggerCh <- true:
-				default:
-					logger.Println("[event] trigger already pending, skipping")
-				}
-			}
-		}
-		resp.Body.Close()
-		time.Sleep(2 * time.Second)
-	}
 }
 
 // ─── Frame Capture (VLC) ──────────────────────────────────
@@ -236,8 +174,7 @@ func motionScore(path1, path2 string) (float64, error) {
 		}
 	}
 
-	score := float64(changed) / float64(total) * 100
-	return score, nil
+	return float64(changed) / float64(total) * 100, nil
 }
 
 // ─── ALPR API ─────────────────────────────────────────────
@@ -324,20 +261,153 @@ func processEvent(cycleCount int) {
 	time.Sleep(time.Duration(cooldownMs) * time.Millisecond)
 }
 
+// ─── Mode: ISAPI Event Stream ─────────────────────────────
+// Connects to the camera's built-in alert stream.
+// Camera pushes a chunk when it detects motion (VMD event).
+// String-based parsing is more resilient than XML decoder for chunked ISAPI streams.
+// https + InsecureSkipVerify: camera self-signed cert, safe on local LAN.
+
+func listenISAPI(triggerCh chan<- bool) {
+	url := fmt.Sprintf("https://%s/ISAPI/Event/notification/alertStream", cameraIP)
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
+
+	for {
+		logger.Println("[event] connecting to camera alert stream...")
+
+		req, err := http.NewRequest("GET", url, nil)
+		if err != nil {
+			logger.Printf("[event] request error: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		req.SetBasicAuth(cameraUser, cameraPass)
+
+		client := &http.Client{
+			Timeout:   0, // no timeout — long-lived stream
+			Transport: transport,
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Printf("[event] connection failed: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		logger.Println("[event] connected to camera alert stream")
+
+		buf := make([]byte, 4096)
+		var accumulated string
+
+		for {
+			n, err := resp.Body.Read(buf)
+			if n > 0 {
+				accumulated += string(buf[:n])
+
+				if strings.Contains(accumulated, "VMD") &&
+					strings.Contains(accumulated, "active") {
+					logger.Println("[event] vehicle motion event from camera")
+					select {
+					case triggerCh <- true:
+					default:
+						logger.Println("[event] trigger already pending, skipping")
+					}
+					accumulated = ""
+				}
+
+				if strings.Contains(accumulated, "heartbeat") {
+					logger.Println("[event] heartbeat received")
+					accumulated = ""
+				}
+
+				// Prevent unbounded growth from unexpected stream data
+				if len(accumulated) > 8192 {
+					accumulated = accumulated[4096:]
+				}
+			}
+			if err != nil {
+				logger.Printf("[event] stream error: %v — reconnecting", err)
+				break
+			}
+		}
+		resp.Body.Close()
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// ─── Mode: Fallback RTSP Frame Polling ────────────────────
+// Used when the camera does not support ISAPI.
+// Polls the RTSP stream every pollIntervalMs and triggers on MD5 change.
+
+func pollFrames(triggerCh chan<- bool) {
+	logger.Println("[polling] starting fallback frame polling mode...")
+	cycleCount := 0
+
+	for {
+		cycleCount++
+		frames, err := captureFrames()
+		if err != nil || len(frames) < 2 {
+			logger.Printf("[polling] capture failed: %v", err)
+			cleanFrames()
+			time.Sleep(time.Duration(pollIntervalMs) * time.Millisecond)
+			continue
+		}
+
+		if framesAreDifferent(frames[0], frames[1]) {
+			logger.Printf("[polling] motion detected on cycle #%d", cycleCount)
+			select {
+			case triggerCh <- true:
+			default:
+			}
+		}
+
+		cleanFrames()
+		time.Sleep(time.Duration(pollIntervalMs) * time.Millisecond)
+	}
+}
+
 // ─── Main ─────────────────────────────────────────────────
 
 func main() {
 	initLogger()
 	logger.Println("[alpr] poller started")
-	logger.Printf("[config] camera=%s threshold=%.0f%% cooldown=%dms",
-		cameraIP, pixelThreshold, cooldownMs)
+	logger.Printf("[config] protocol=%s camera=%s threshold=%.0f%% cooldown=%dms",
+		cameraProtocol, cameraIP, pixelThreshold, cooldownMs)
 
-	// Buffered channel — holds one pending trigger
 	triggerCh := make(chan bool, 1)
 
-	// Camera event listener runs in background
-	// When camera detects a vehicle (VMD event), it pushes to triggerCh
-	go listenCameraEvents(triggerCh)
+	switch cameraProtocol {
+	case "isapi":
+		logger.Println("[init] mode: ISAPI alert stream")
+		go listenISAPI(triggerCh)
+
+	case "polling":
+		logger.Println("[init] mode: fallback RTSP frame polling")
+		go pollFrames(triggerCh)
+
+	default: // "auto"
+		logger.Println("[init] mode: auto-detect (ISAPI with polling fallback)")
+		go func() {
+			testURL := fmt.Sprintf("https://%s/ISAPI/System/status", cameraIP)
+			req, _ := http.NewRequest("GET", testURL, nil)
+			req.SetBasicAuth(cameraUser, cameraPass)
+			transport := &http.Transport{
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			}
+			client := &http.Client{Timeout: 5 * time.Second, Transport: transport}
+			resp, err := client.Do(req)
+			if err == nil && resp.StatusCode == 200 {
+				resp.Body.Close()
+				logger.Println("[auto] ISAPI detected — isapi mode")
+				listenISAPI(triggerCh)
+			} else {
+				logger.Println("[auto] ISAPI not available — fallback polling mode")
+				pollFrames(triggerCh)
+			}
+		}()
+	}
 
 	cycleCount := 0
 	for range triggerCh {
