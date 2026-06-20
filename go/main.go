@@ -1,217 +1,337 @@
 // ─────────────────────────────────────────
 // ALPR Poller — Go  ★ OPTIMIZED
 // Camera: Prama PT-NC140D3-WNM(D2)
+// Tested on: Raspberry Pi 4 Model B — 4 GB RAM
+//            Raspberry Pi OS Debian 13 (Trixie)
+//            Kernel: Linux 6.18.33-rpt-rpi-v8
 // ─────────────────────────────────────────
 // Single file, zero external dependencies (stdlib only).
 //
-// Run on Pi:        go run main.go
-// Cross-compile:    GOOS=linux GOARCH=arm64 go build -o poller .
-//                   scp poller pi@<ip>:~/ && ssh pi@<ip> ./poller
+// Run:           go run main.go
+// Build for Pi:  go build -o alpr-poller .
+// See SETUP.md for full installation guide.
 
 package main
 
 import (
 	"bytes"
 	"crypto/md5"
-	"encoding/json"
+	"encoding/xml"
 	"fmt"
+	"image"
+	"image/jpeg"
 	"io"
 	"log"
-	"math"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"time"
 )
 
-// ── Config (edit these)
+// ── Config (edit these before running)
 const (
-	rtspURL         = "rtsp://{username}:{password}@{your_ip}:{port}/Streaming/channels/101"
-	apiKey          = "your key, if any"
-	apiBase         = "your api url"
-	country         = "IND"
-	intervalMs      = 2000
-	cooldownMs      = 4000
-	motionThreshold = 30.0
-	maxRetries      = 3
+	rtspURL          = "rtsp://{username}:{password}@{camera_ip}:{port}/Streaming/Channels/101"
+	cameraIP         = "{camera_ip}"
+	cameraUser       = "{camera_username}"
+	cameraPass       = "{camera_password}"
+	apiKey           = "your key, if any"
+	apiBase          = "your api url"
+	country          = "IND"
+	cooldownMs       = 4000
+	sceneRatio       = 8       // capture 1 frame every N video frames
+	pixelThreshold   = 25.0   // % of frame pixels that must change to confirm motion
+	pixelSensitivity = 10000  // per-pixel diff sensitivity
+	logFile          = "/var/log/alpr.log"
 )
 
-const currFrame = "/tmp/alpr_curr.jpg"
-const prevFrame = "/tmp/alpr_prev.jpg"
+var logger *log.Logger
 
-// ── Capture one JPEG frame via ffmpeg
-func captureFrame() (curr []byte, prev []byte, err error) {
-	if _, e := os.Stat(currFrame); e == nil {
-		os.Rename(currFrame, prevFrame)
-	}
+// ─── Logger ───────────────────────────────────────────────
 
-	cmd := exec.Command("ffmpeg",
-		"-loglevel", "error",
-		"-rtsp_transport", "tcp",
-		"-i", rtspURL,
-		"-frames:v", "1",
-		"-q:v", "3",
-		"-vf", "scale=640:480",
-		currFrame, "-y",
-	)
-	cmd.Stdout = io.Discard
-	cmd.Stderr = io.Discard
-
-	done := make(chan error, 1)
-	if err = cmd.Start(); err != nil {
-		return nil, nil, fmt.Errorf("ffmpeg start: %w", err)
-	}
-	go func() { done <- cmd.Wait() }()
-
-	select {
-	case e := <-done:
-		if e != nil {
-			return nil, nil, fmt.Errorf("ffmpeg: %w", e)
-		}
-	case <-time.After(6 * time.Second):
-		cmd.Process.Kill()
-		return nil, nil, fmt.Errorf("ffmpeg timeout")
-	}
-
-	curr, err = os.ReadFile(currFrame)
+func initLogger() {
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
-		return nil, nil, err
+		logger = log.New(os.Stdout, "", log.LstdFlags)
+		logger.Printf("[warn] could not open log file: %v", err)
+		return
 	}
-	if _, e := os.Stat(prevFrame); e == nil {
-		prev, _ = os.ReadFile(prevFrame)
-	}
-	return curr, prev, nil
+	multi := io.MultiWriter(f, os.Stdout)
+	logger = log.New(multi, "", log.LstdFlags)
+	logger.Println("[init] logger initialized →", logFile)
 }
 
-// ── Motion detection: MD5 check + sampled byte diff score
-func detectMotion(current, previous []byte) bool {
-	if previous == nil {
-		return false
-	}
-	if md5.Sum(current) == md5.Sum(previous) {
-		return false
-	}
-	length := len(current)
-	if len(previous) < length {
-		length = len(previous)
-	}
-	var diff, samples float64
-	for i := 0; i < length; i += 10 {
-		diff += math.Abs(float64(current[i]) - float64(previous[i]))
-		samples++
-	}
-	score := (diff / samples) / 255.0 * 100.0
-	log.Printf("[motion] %.2f%%", score)
-	return score > motionThreshold
+// ─── Camera Event Listener (Prama/Hikvision ISAPI) ────────
+// Connects to the camera's built-in alert stream.
+// The camera pushes an XML event when it detects a vehicle (VMD).
+// This replaces blind polling — API is only called on a real event.
+
+type EventNotification struct {
+	EventType        string `xml:"eventType"`
+	EventState       string `xml:"eventState"`
+	EventDescription string `xml:"eventDescription"`
 }
 
-// ── POST frame to ALPR API
-func scanPlate(client *http.Client) (map[string]any, error) {
-	data, err := os.ReadFile(currFrame)
-	if err != nil {
-		return nil, err
-	}
-
-	var body bytes.Buffer
-	w := multipart.NewWriter(&body)
-	fw, _ := w.CreateFormFile("image", "frame.jpg")
-	fw.Write(data)
-	w.WriteField("country", country)
-	w.Close()
-
-	req, _ := http.NewRequest(http.MethodPost, apiBase+"/plate/recognize", &body)
-	req.Header.Set("Content-Type", w.FormDataContentType())
-	req.Header.Set("x-api-key", apiKey)
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("ALPR API %d", resp.StatusCode)
-	}
-	var result map[string]any
-	json.NewDecoder(resp.Body).Decode(&result)
-	return result, nil
-}
-
-// ── Notify backend after confirmed plate
-func notifyBackend(client *http.Client, result map[string]any) {
-	payload, _ := json.Marshal(map[string]any{
-		"plate":      result["plate"],
-		"confidence": result["confidence"],
-		"country":    country,
-		"timestamp":  time.Now().UTC().Format(time.RFC3339),
-		"source":     "go-poller-v3",
-	})
-	req, _ := http.NewRequest(http.MethodPost, apiBase+"/entry", bytes.NewReader(payload))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("x-api-key", apiKey)
-	resp, err := client.Do(req)
-	if err == nil {
-		resp.Body.Close()
-	}
-}
-
-// ── Main loop
-func main() {
-	log.Println("[alpr] go poller started")
-	log.Printf("[camera] %s", rtspURL)
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	interval := time.Duration(intervalMs) * time.Millisecond
-	cooldown := time.Duration(cooldownMs) * time.Millisecond
-
-	var lastPlate time.Time
-	errors := 0
+func listenCameraEvents(triggerCh chan<- bool) {
+	url := fmt.Sprintf("http://%s/ISAPI/Event/notification/alertStream", cameraIP)
 
 	for {
-		t0 := time.Now()
+		logger.Println("[event] connecting to camera alert stream...")
 
-		if !lastPlate.IsZero() && time.Since(lastPlate) < cooldown {
-			log.Println("[cooldown] skipping")
-			time.Sleep(interval)
-			continue
-		}
-
-		curr, prev, err := captureFrame()
+		req, err := http.NewRequest("GET", url, nil)
 		if err != nil {
-			errors++
-			log.Printf("[error] #%d: %v", errors, err)
-			if errors >= maxRetries {
-				log.Println("[error] too many failures, waiting 30s")
-				time.Sleep(30 * time.Second)
-				errors = 0
-			}
-			time.Sleep(interval)
+			logger.Printf("[event] request error: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
 			continue
 		}
-		errors = 0
+		req.SetBasicAuth(cameraUser, cameraPass)
 
-		if !detectMotion(curr, prev) {
-			log.Println("[motion] none")
-		} else {
-			log.Println("[motion] detected — scanning plate")
-			result, err := scanPlate(client)
-			if err != nil {
-				log.Printf("[error] alpr: %v", err)
-			} else {
-				log.Printf("[alpr] %v", result)
-				if plate, ok := result["plate"].(string); ok && plate != "" {
-					log.Printf("[plate] %s (%.0f%%)", plate, result["confidence"])
-					notifyBackend(client, result)
-					lastPlate = time.Now()
-					log.Printf("[cooldown] %ds", cooldownMs/1000)
-				} else {
-					log.Println("[plate] none found")
+		client := &http.Client{Timeout: 0} // no timeout — long-lived stream
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Printf("[event] connection failed: %v — retrying in 5s", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+
+		logger.Println("[event] connected to camera alert stream")
+
+		decoder := xml.NewDecoder(resp.Body)
+		for {
+			var event EventNotification
+			if err := decoder.Decode(&event); err != nil {
+				logger.Printf("[event] stream error: %v — reconnecting", err)
+				break
+			}
+
+			logger.Printf("[event] received: type=%s state=%s desc=%s",
+				event.EventType, event.EventState, event.EventDescription)
+
+			// Trigger only on VMD (Video Motion Detection) active events
+			if event.EventType == "VMD" && event.EventState == "active" {
+				logger.Println("[event] vehicle motion event from camera")
+				select {
+				case triggerCh <- true:
+				default:
+					logger.Println("[event] trigger already pending, skipping")
 				}
 			}
 		}
+		resp.Body.Close()
+		time.Sleep(2 * time.Second)
+	}
+}
 
-		if elapsed := time.Since(t0); elapsed < interval {
-			time.Sleep(interval - elapsed)
+// ─── Frame Capture (VLC) ──────────────────────────────────
+// Uses cvlc scene filter to capture multiple JPEG frames
+// from the RTSP stream in one 1-second burst.
+
+func cleanFrames() {
+	files, _ := filepath.Glob("/tmp/alpr_curr*.jpeg")
+	for _, f := range files {
+		os.Remove(f)
+	}
+}
+
+func captureFrames() ([]string, error) {
+	cleanFrames()
+
+	cmd := exec.Command("cvlc",
+		"--no-audio",
+		"--video-filter=scene",
+		"--scene-format=jpeg",
+		fmt.Sprintf("--scene-ratio=%d", sceneRatio),
+		"--scene-prefix=alpr_curr",
+		"--scene-path=/tmp",
+		"--run-time=1",
+		rtspURL,
+		"vlc://quit",
+	)
+	cmd.Stderr = nil
+
+	if err := cmd.Run(); err != nil {
+		return nil, err
+	}
+
+	files, _ := filepath.Glob("/tmp/alpr_curr*.jpeg")
+	return files, nil
+}
+
+// ─── Layer 1: MD5 Quick Check ─────────────────────────────
+// Fast identical-frame filter before expensive pixel comparison.
+
+func md5File(path string) ([]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	h := md5.New()
+	io.Copy(h, f)
+	return h.Sum(nil), nil
+}
+
+func framesAreDifferent(f1, f2 string) bool {
+	h1, err1 := md5File(f1)
+	h2, err2 := md5File(f2)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	return !bytes.Equal(h1, h2)
+}
+
+// ─── Layer 2: Pixel Area Threshold ────────────────────────
+// Counts how many pixels changed significantly between two frames.
+// Returns % of total pixels changed. Filters out shadows, birds,
+// headlights, and small false positives.
+
+func loadImage(path string) (image.Image, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return jpeg.Decode(f)
+}
+
+func absInt(x int) int {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+func motionScore(path1, path2 string) (float64, error) {
+	img1, err1 := loadImage(path1)
+	img2, err2 := loadImage(path2)
+	if err1 != nil || err2 != nil {
+		return 0, fmt.Errorf("image load failed: %v | %v", err1, err2)
+	}
+
+	bounds := img1.Bounds()
+	total := bounds.Dx() * bounds.Dy()
+	changed := 0
+
+	for y := bounds.Min.Y; y < bounds.Max.Y; y++ {
+		for x := bounds.Min.X; x < bounds.Max.X; x++ {
+			r1, g1, b1, _ := img1.At(x, y).RGBA()
+			r2, g2, b2, _ := img2.At(x, y).RGBA()
+			diff := absInt(int(r1)-int(r2)) +
+				absInt(int(g1)-int(g2)) +
+				absInt(int(b1)-int(b2))
+			if diff > pixelSensitivity {
+				changed++
+			}
 		}
+	}
+
+	score := float64(changed) / float64(total) * 100
+	return score, nil
+}
+
+// ─── ALPR API ─────────────────────────────────────────────
+
+func callALPR(framePath string) (string, error) {
+	file, err := os.Open(framePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, _ := writer.CreateFormFile("image", filepath.Base(framePath))
+	io.Copy(part, file)
+	writer.WriteField("country", country)
+	writer.Close()
+
+	req, _ := http.NewRequest("POST", apiBase, &body)
+	req.Header.Set("Content-Type", writer.FormDataContentType())
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	respBody, _ := io.ReadAll(resp.Body)
+	return string(respBody), nil
+}
+
+// ─── Processing Pipeline ──────────────────────────────────
+
+func processEvent(cycleCount int) {
+	logger.Printf("[cycle #%d] vehicle event received — capturing frames...", cycleCount)
+
+	frames, err := captureFrames()
+	if err != nil || len(frames) < 2 {
+		logger.Printf("[error] capture failed (got %d frames): %v", len(frames), err)
+		cleanFrames()
+		return
+	}
+
+	logger.Printf("[capture] got %d frames", len(frames))
+
+	// Layer 1: Quick MD5 check
+	if !framesAreDifferent(frames[0], frames[1]) {
+		logger.Println("[filter] md5 identical — false trigger, skipping")
+		cleanFrames()
+		return
+	}
+
+	// Layer 2: Pixel area threshold
+	score, err := motionScore(frames[0], frames[1])
+	if err != nil {
+		logger.Printf("[error] motion score failed: %v", err)
+		cleanFrames()
+		return
+	}
+
+	logger.Printf("[motion] change score: %.2f%% (threshold: %.2f%%)", score, pixelThreshold)
+
+	if score < pixelThreshold {
+		logger.Printf("[filter] score %.2f%% below threshold — shadow/bird/headlight ignored", score)
+		cleanFrames()
+		return
+	}
+
+	// Both layers passed — call ALPR API
+	logger.Printf("[alpr] score %.2f%% confirmed — sending frame to ALPR API", score)
+
+	respBody, err := callALPR(frames[0])
+	if err != nil {
+		logger.Printf("[error] ALPR API failed: %v", err)
+		cleanFrames()
+		return
+	}
+
+	logger.Printf("[alpr] response: %s", respBody)
+	cleanFrames()
+	logger.Printf("[cooldown] waiting %dms", cooldownMs)
+	time.Sleep(time.Duration(cooldownMs) * time.Millisecond)
+}
+
+// ─── Main ─────────────────────────────────────────────────
+
+func main() {
+	initLogger()
+	logger.Println("[alpr] poller started")
+	logger.Printf("[config] camera=%s threshold=%.0f%% cooldown=%dms",
+		cameraIP, pixelThreshold, cooldownMs)
+
+	// Buffered channel — holds one pending trigger
+	triggerCh := make(chan bool, 1)
+
+	// Camera event listener runs in background
+	// When camera detects a vehicle (VMD event), it pushes to triggerCh
+	go listenCameraEvents(triggerCh)
+
+	cycleCount := 0
+	for range triggerCh {
+		cycleCount++
+		processEvent(cycleCount)
 	}
 }
