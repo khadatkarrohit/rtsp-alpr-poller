@@ -16,6 +16,7 @@ package main
 import (
 	"bytes"
 	"crypto/md5"
+	"crypto/tls"
 	"encoding/xml"
 	"fmt"
 	"image"
@@ -74,7 +75,13 @@ type EventNotification struct {
 }
 
 func listenCameraEvents(triggerCh chan<- bool) {
-	url := fmt.Sprintf("http://%s/ISAPI/Event/notification/alertStream", cameraIP)
+	// Use https — camera redirects http → https with a self-signed cert.
+	// InsecureSkipVerify is safe here: this is a local LAN camera, not the internet.
+	url := fmt.Sprintf("https://%s/ISAPI/Event/notification/alertStream", cameraIP)
+
+	transport := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+	}
 
 	for {
 		logger.Println("[event] connecting to camera alert stream...")
@@ -87,7 +94,10 @@ func listenCameraEvents(triggerCh chan<- bool) {
 		}
 		req.SetBasicAuth(cameraUser, cameraPass)
 
-		client := &http.Client{Timeout: 0} // no timeout — long-lived stream
+		client := &http.Client{
+			Timeout:   0, // no timeout — long-lived stream
+			Transport: transport,
+		}
 		resp, err := client.Do(req)
 		if err != nil {
 			logger.Printf("[event] connection failed: %v — retrying in 5s", err)
