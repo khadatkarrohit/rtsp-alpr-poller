@@ -5,7 +5,7 @@ RTSP frame pollers for Raspberry Pi. Each poller captures a frame from a camera 
 > **Tested and working on Raspberry Pi 4 (4 GB RAM).**  
 > Successfully detects vehicles from a live RTSP stream, captures the frame, and sends it to the ALPR API for licence plate recognition.
 
-**Hardware tested:** Raspberry Pi 4 — 4 GB RAM  
+**Hardware tested:** Raspberry Pi 4 Model B — 4 GB RAM  
 **Camera tested:** Prama PT-NC140D3-WNM(D2)  
 **RTSP format:** `rtsp://{username}:{password}@{your_ip}:{port}/Streaming/channels/101`
 
