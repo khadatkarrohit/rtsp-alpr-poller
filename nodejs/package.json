@@ -1,0 +1,16 @@
+{
+  "name": "rtsp-alpr-poller-nodejs",
+  "version": "1.0.0",
+  "description": "RTSP frame capture + ALPR API poller in Node.js",
+  "main": "poller.js",
+  "scripts": {
+    "start": "node poller.js"
+  },
+  "dependencies": {
+    "form-data": "^4.0.0",
+    "node-fetch": "^2.7.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

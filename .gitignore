@@ -1,0 +1,9 @@
+node_modules/
+target/
+build/
+*.class
+*.jar
+__pycache__/
+*.pyc
+.DS_Store
+/tmp/alpr_frame.jpg
