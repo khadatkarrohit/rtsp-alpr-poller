@@ -42,10 +42,10 @@ const (
 	country    = "IND"
 
 	// cameraProtocol selects how the poller listens for vehicle events:
-	//   "isapi"   — ISAPI alert stream (any ISAPI-compatible camera)
-	//   "polling" — fallback RTSP frame polling (any camera)
+	//   "polling" — RTSP frame polling (works with any IP camera)
+	//   "isapi"   — ISAPI alert stream (cameras with ISAPI support only)
 	//   "auto"    — try ISAPI first, fall back to polling automatically
-	cameraProtocol = "isapi"
+	cameraProtocol = "polling"
 
 	cooldownMs       = 4000
 	pollIntervalMs   = 2000  // used in polling mode
@@ -380,11 +380,11 @@ func main() {
 
 	switch cameraProtocol {
 	case "isapi":
-		logger.Println("[init] mode: ISAPI alert stream")
+		logger.Println("[init] mode: ISAPI alert stream (cameras with ISAPI support only)")
 		go listenISAPI(triggerCh)
 
 	case "polling":
-		logger.Println("[init] mode: fallback RTSP frame polling")
+		logger.Println("[init] mode: RTSP frame polling")
 		go pollFrames(triggerCh)
 
 	default: // "auto"
